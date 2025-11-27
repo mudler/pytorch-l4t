@@ -1,0 +1,136 @@
+name: Build PyTorch ARM64 Wheels
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      pytorch_version:
+        description: 'PyTorch git ref (tag/branch/commit)'
+        required: false
+        default: 'main'
+        type: string
+      cuda_version:
+        description: 'CUDA version'
+        required: false
+        default: '13.0'
+        type: string
+      torch_cuda_arch_list:
+        description: 'Comma-separated CUDA architectures (e.g., sm_75,sm_80)'
+        required: false
+        default: 'sm_75,sm_80,sm_86,sm_87,sm_88,sm_89,sm_90,sm_90a,sm_100,sm_100f,sm_100a,sm_103,sm_103f,sm_103a,sm_110,sm_110f,sm_110a,sm_120,sm_120f,sm_120a,sm_121,sm_121f,sm_121a'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+      fail-fast: false
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # this might remove tools that are actually needed,
+        # if set to "true" but frees about 6 GB
+        tool-cache: true
+        # all of these default to true, but feel free to set to
+        # "false" if necessary for your workflow
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git wget make
+
+    - name: Install CUDA
+      run: |
+        CUDA_VERSION="${{ github.event.inputs.cuda_version || '13.0' }}"
+        CUDA_MAJOR=$(echo $CUDA_VERSION | cut -d. -f1)
+        CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
+        
+        # Download CUDA installer
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update
+        sudo apt-get -y install cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR}
+        
+        # Set CUDA_HOME
+        echo "CUDA_HOME=/usr/local/cuda-${CUDA_VERSION}" >> $GITHUB_ENV
+        echo "/usr/local/cuda-${CUDA_VERSION}/bin" >> $GITHUB_PATH
+
+    - name: Build PyTorch wheel using Makefile
+      env:
+        PYTORCH_VERSION: ${{ github.event.inputs.pytorch_version || 'main' }}
+        CUDA_VERSION: ${{ github.event.inputs.cuda_version || '13.0' }}
+        CUDA_HOME: /usr/local/cuda-${{ github.event.inputs.cuda_version || '13.0' }}
+        TORCH_CUDA_ARCH_LIST_SM: ${{ github.event.inputs.torch_cuda_arch_list || 'sm_75,sm_80,sm_86,sm_87,sm_88,sm_89,sm_90,sm_90a,sm_100,sm_100f,sm_100a,sm_103,sm_103f,sm_103a,sm_110,sm_110f,sm_110a,sm_120,sm_120f,sm_120a,sm_121,sm_121f,sm_121a' }}
+        PYTHON: python
+      run: |
+        make build
+
+    - name: Upload wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheel-python${{ matrix.python-version }}
+        path: dist/*.whl
+        retention-days: 30
+
+  generate-index:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Download all wheel artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: wheels
+
+    - name: Generate pip-compatible index
+      run: |
+        mkdir -p index
+        echo "<!DOCTYPE html>" > index/index.html
+        echo "<html><head><title>PyTorch ARM64 Wheels</title></head><body>" >> index/index.html
+        echo "<h1>PyTorch ARM64 Wheels</h1>" >> index/index.html
+        echo "<p>Built for: ${{ github.event.release.tag_name }}</p>" >> index/index.html
+        echo "<ul>" >> index/index.html
+        
+        find wheels -name "*.whl" | while read wheel; do
+          wheelname=$(basename "$wheel")
+          echo "<li><a href=\"https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/$wheelname\">$wheelname</a></li>" >> index/index.html
+        done
+        
+        echo "</ul></body></html>" >> index/index.html
+        
+        # Also create a simple text index for pip --find-links
+        find wheels -name "*.whl" | while read wheel; do
+          wheelname=$(basename "$wheel")
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.event.release.tag_name }}/$wheelname" >> index/index.txt
+        done
+
+    - name: Upload wheels and index to release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          wheels/**/*.whl
+          index/index.html
+          index/index.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
