@@ -69,21 +69,97 @@ jobs:
         wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update
-        sudo apt-get -y install cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR}
+        
+        # List available CUDA packages for debugging
+        echo "Available CUDA packages:"
+        apt-cache search cuda-toolkit | head -20 || true
+        
+        # Try to find and install the correct CUDA package
+        # Package names can vary: cuda-toolkit-13-0, cuda-toolkit-13, cuda-13-0, etc.
+        PACKAGE_FOUND=false
+        
+        # Try: cuda-toolkit-<major>-<minor>
+        if apt-cache show cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR} >/dev/null 2>&1; then
+          echo "Installing cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR}"
+          sudo apt-get -y install cuda-toolkit-${CUDA_MAJOR}-${CUDA_MINOR}
+          PACKAGE_FOUND=true
+        # Try: cuda-toolkit-<major>
+        elif apt-cache show cuda-toolkit-${CUDA_MAJOR} >/dev/null 2>&1; then
+          echo "Installing cuda-toolkit-${CUDA_MAJOR}"
+          sudo apt-get -y install cuda-toolkit-${CUDA_MAJOR}
+          PACKAGE_FOUND=true
+        # Try: cuda-<major>-<minor>
+        elif apt-cache show cuda-${CUDA_MAJOR}-${CUDA_MINOR} >/dev/null 2>&1; then
+          echo "Installing cuda-${CUDA_MAJOR}-${CUDA_MINOR}"
+          sudo apt-get -y install cuda-${CUDA_MAJOR}-${CUDA_MINOR}
+          PACKAGE_FOUND=true
+        fi
+        
+        # If specific version not found, try to install available CUDA
+        if [ "$PACKAGE_FOUND" = false ]; then
+          echo "Warning: CUDA ${CUDA_VERSION} package not found, installing available CUDA packages"
+          # Try to install cuda (meta-package) or cuda-toolkit
+          if apt-cache show cuda >/dev/null 2>&1; then
+            sudo apt-get -y install cuda
+          elif apt-cache show cuda-toolkit >/dev/null 2>&1; then
+            sudo apt-get -y install cuda-toolkit
+          else
+            echo "Error: No CUDA packages found in repository"
+            exit 1
+          fi
+        fi
+        
+        # Find actual CUDA installation path
+        # CUDA is typically installed to /usr/local/cuda-<version> or /usr/local/cuda
+        CUDA_HOME=""
+        if [ -d "/usr/local/cuda-${CUDA_VERSION}" ]; then
+          CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
+        elif [ -d "/usr/local/cuda" ]; then
+          # Check if it's a symlink or get actual version
+          if [ -L "/usr/local/cuda" ]; then
+            CUDA_HOME=$(readlink -f /usr/local/cuda)
+          else
+            CUDA_HOME="/usr/local/cuda"
+            # Try to determine version from version.txt
+            if [ -f "$CUDA_HOME/version.txt" ]; then
+              ACTUAL_VERSION=$(grep -oP 'CUDA Version \K[0-9]+\.[0-9]+' $CUDA_HOME/version.txt 2>/dev/null || echo "")
+              if [ -n "$ACTUAL_VERSION" ] && [ -d "/usr/local/cuda-${ACTUAL_VERSION}" ]; then
+                CUDA_HOME="/usr/local/cuda-${ACTUAL_VERSION}"
+              fi
+            fi
+          fi
+        else
+          # Search for any cuda-* directory
+          CUDA_DIR=$(ls -d /usr/local/cuda-* 2>/dev/null | head -1)
+          if [ -n "$CUDA_DIR" ]; then
+            CUDA_HOME="$CUDA_DIR"
+          else
+            echo "Error: CUDA installation not found in /usr/local/"
+            exit 1
+          fi
+        fi
+        
+        # Verify CUDA installation
+        if [ ! -d "$CUDA_HOME" ] || [ ! -f "$CUDA_HOME/bin/nvcc" ]; then
+          echo "Error: CUDA installation incomplete at $CUDA_HOME"
+          exit 1
+        fi
         
         # Set CUDA_HOME
-        echo "CUDA_HOME=/usr/local/cuda-${CUDA_VERSION}" >> $GITHUB_ENV
-        echo "/usr/local/cuda-${CUDA_VERSION}/bin" >> $GITHUB_PATH
+        echo "CUDA_HOME=${CUDA_HOME}" >> $GITHUB_ENV
+        echo "${CUDA_HOME}/bin" >> $GITHUB_PATH
+        echo "CUDA installed at: ${CUDA_HOME}"
+        ${CUDA_HOME}/bin/nvcc --version || true
 
     - name: Build PyTorch wheel using Makefile
       env:
         PYTORCH_VERSION: ${{ github.event.inputs.pytorch_version || 'main' }}
         CUDA_VERSION: ${{ github.event.inputs.cuda_version || '13.0' }}
-        CUDA_HOME: /usr/local/cuda-${{ github.event.inputs.cuda_version || '13.0' }}
         TORCH_CUDA_ARCH_LIST_SM: ${{ github.event.inputs.torch_cuda_arch_list || 'sm_75,sm_80,sm_86,sm_87,sm_88,sm_89,sm_90,sm_90a,sm_100,sm_100f,sm_100a,sm_103,sm_103f,sm_103a,sm_110,sm_110f,sm_110a,sm_120,sm_120f,sm_120a,sm_121,sm_121f,sm_121a' }}
         PYTHON: python
       run: |
-        make build
+        # CUDA_HOME is set in previous step via GITHUB_ENV
+        make build CUDA_HOME="${CUDA_HOME}"
 
     - name: Upload wheel artifact
       uses: actions/upload-artifact@v4
